@@ -600,7 +600,7 @@ f(x) = x*x
     if A <: DuplicatedNoNeed || A <: BatchDuplicatedNoNeed
         throw(
             ErrorException(
-                "Return activity `DuplicatedNoNeed` is no longer now returning or avoiding the primal is passed in for Forward Mode AD.\nPlease use autodiff(Forward, ...) or autodiff(ForwardWithPrimal, ...)",
+                "`DuplicatedNoNeed` passed in as return activity for Forward Mode AD is no longer returning or avoiding the primal.\nPlease use autodiff(Forward, ...) or autodiff(ForwardWithPrimal, ...)",
             ),
         )
     end
@@ -682,15 +682,19 @@ code, as well as high-order differentiation.
 
     if A isa UnionAll
         rt = Compiler.primal_return_type(rmode, Val(world), FTy, tt)
-        A2 = A{rt}
+        rt = Core.Compiler.return_type(f.val, tt)
+	A2 = A{rt}
+	if rt == Union{}
+	    throw(ErrorException("Return type inferred to be Union{}. Giving up."))
+        end
     else
         @assert A isa DataType
         rt = A
+	if rt == Union{}
+	    throw(ErrorException("Return type inferred to be Union{}. Giving up."))
+        end
     end
 
-    if rt == Union{}
-        error("Return type inferred to be Union{}. Giving up.")
-    end
 
     ModifiedBetweenT = falses_from_args(Nargs + 1)
     ModifiedBetween = Val(ModifiedBetweenT)

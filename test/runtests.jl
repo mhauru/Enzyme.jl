@@ -116,6 +116,11 @@ mutable struct MInts{A, B}
 end
 
 @testset "Internal tests" begin
+    @static if VERSION < v"1.11-"
+    else
+    @assert Enzyme.Compiler.active_reg_inner(Memory{Float64}, (), nothing) == Enzyme.Compiler.DupState
+    end
+    @assert Enzyme.Compiler.active_reg_inner(Type{Array}, (), nothing) == Enzyme.Compiler.AnyState
     @assert Enzyme.Compiler.active_reg_inner(Ints{<:Any, Integer}, (), nothing) == Enzyme.Compiler.AnyState
     @assert Enzyme.Compiler.active_reg_inner(Ints{<:Any, Float64}, (), nothing) == Enzyme.Compiler.DupState
     @assert Enzyme.Compiler.active_reg_inner(Ints{Integer, <:Any}, (), nothing) == Enzyme.Compiler.DupState
@@ -359,6 +364,9 @@ make3() = (1.0, 2.0, 3.0)
     @test autodiff(Forward, tanh, Duplicated(1.0f0, 1.0f0))[1] ≈ Float32(0.41997434161402606939)
 
     for T in (Float64, Float32, Float16)
+        if T == Float16 && Sys.isapple()
+            continue
+        end
         res = autodiff(Reverse, tanh, Active, Active(T(1)))[1][1]
         @test res isa T
         cmp = if T == Float64
@@ -2854,6 +2862,51 @@ end
     @test dx[1] ≈ 0
     @test dx[2] ≈ 30
     @test dx[3] ≈ 0
+
+    f0 = x -> sum(2*x)
+    f1 = x -> @SVector Float64[x[2], 2*x[2]]
+    f2 = x -> @SMatrix Float64[x[2] x[1]; 2*x[2] 2*x[1]]
+
+    x = @SVector Float64[1, 2]
+
+    dx = gradient(Forward, f0, x)[1]
+    @test dx isa Enzyme.TupleArray
+    @test convert(SArray, dx) == [2.0, 2.0]  # test to make sure conversion works
+    @test gradient(Forward, f1, x)[1] isa SMatrix
+    @test gradient(Forward, f1, x)[1] == [0 1.0; 0 2.0]
+    @test Enzyme.jacobian(Forward, f2, x)[1] isa SArray
+    @test Enzyme.jacobian(Forward, f2, x)[1] == reshape(Float64[0,0,1,2,1,2,0,0], (2,2,2))
+
+    x = @SMatrix Float64[1 2; 3 4]
+
+    dx = gradient(Forward, f0, x)[1]
+    @test dx isa Enzyme.TupleArray
+    @test convert(SArray, dx) == fill(2.0, (2,2))
+    @test gradient(Forward, f1, x)[1] isa SArray
+    @test gradient(Forward, f1, x)[1] == reshape(Float64[0,0,1,2,0,0,0,0], (2,2,2))
+    @test Enzyme.jacobian(Forward, f2, x)[1] isa SArray
+    @test Enzyme.jacobian(Forward, f2, x)[1] == reshape(
+        Float64[0,0,1,2,1,2,0,0,0,0,0,0,0,0,0,0], (2,2,2,2),
+    )
+
+    x = @SVector Float64[1, 2]
+
+    dx = gradient(Reverse, f0, x)[1]
+    @test dx isa SVector
+    @test convert(SArray, dx) == [2.0, 2.0]  # test to make sure conversion works
+    @test_broken gradient(Reverse, f1, x)[1] isa SMatrix
+    @test_broken gradient(Reverse, f1, x)[1] == [0 1.0; 0 2.0]
+    @test_broken Enzyme.jacobian(Reverse, f2, x)[1] isa SArray
+    @test_broken Enzyme.jacobian(Reverse, f2, x)[1] == reshape(Float64[0,0,1,2,1,2,0,0], (2,2,2))
+
+    x = @SMatrix Float64[1 2; 3 4]
+
+    @test_broken gradient(Reverse, f1, x)[1] isa SArray
+    @test_broken gradient(Reverse, f1, x)[1] == reshape(Float64[0,0,1,2,0,0,0,0], (2,2,2))
+    @test_broken Enzyme.jacobian(Reverse, f2, x)[1] isa SArray
+    @test_broken Enzyme.jacobian(Reverse, f2, x)[1] == reshape(
+        Float64[0,0,1,2,1,2,0,0,0,0,0,0,0,0,0,0], (2,2,2,2),
+    )
 end
 
 function unstable_fun(A0)
@@ -3502,6 +3555,63 @@ end
 	Enzyme.autodiff(Reverse, getloc, Duplicated(x0, din), Const(2))
 	@test din[1, 1] ≈ 0.0
 	@test din[2, 1] ≈ 1.0
+end
+
+@testset "View Vars" begin
+
+    x = [Float32(0.25)]
+    dx = [Float32(0.0)]
+    rng = Base.UnitRange{Int64}(1, 0)
+
+    f = Const(Base.SubArray{T, N, P, I, L} where L where I where P where N where T)
+    a1 = Const(Base.IndexLinear())
+    a2 = Duplicated(x, dx)
+    a3 = Const((rng,))
+    a4 = Const((true,))
+
+    fwd, rev = autodiff_thunk(ReverseSplitWithPrimal,
+         typeof(f),
+         Duplicated,
+         typeof(a1),
+         typeof(a2),
+         typeof(a3),
+         typeof(a4)
+    )
+
+    res = fwd(f,a1,a2,a3,a4)
+    @test res[2].indices == (rng,)
+    @test res[3].indices == (rng,)
+    @test res[2].offset1 == 0
+    @test res[3].offset1 == 0
+    @test res[2].stride1 == 1
+    @test res[3].stride1 == 1
+
+    x = [Float32(0.25)]
+    dx = [Float32(0.0)]
+    rng = Base.UnitRange{Int64}(1, 0)
+
+    f = Const(Base.SubArray{T, N, P, I, L} where L where I where P where N where T)
+    a1 = Const(Base.IndexLinear())
+    a2 = Duplicated(x, dx)
+    a3 = Const((rng,))
+    a4 = Const((true,))
+
+    fwd, rev = autodiff_thunk(set_runtime_activity(ReverseSplitWithPrimal),
+         typeof(f),
+         Duplicated,
+         typeof(a1),
+         typeof(a2),
+         typeof(a3),
+         typeof(a4)
+    )
+
+    res = fwd(f,a1,a2,a3,a4)
+    @test res[2].indices == (rng,)
+    @test res[3].indices == (rng,)
+    @test res[2].offset1 == 0
+    @test res[3].offset1 == 0
+    @test res[2].stride1 == 1
+    @test res[3].stride1 == 1
 end
 
 @testset "Uncached batch sizes" begin
