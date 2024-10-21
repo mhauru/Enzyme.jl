@@ -783,6 +783,7 @@ function nodecayed_phis!(mod::LLVM.Module)
                         b = IRBuilder()
                         position!(b, terminator(pb))
 
+
                         v0 = v
                         @inline function getparent(v, offset, hasload)
                             if addr == 11 && addrspace(value_type(v)) == 10
@@ -791,8 +792,52 @@ function nodecayed_phis!(mod::LLVM.Module)
                             if addr == 13 && hasload && addrspace(value_type(v)) == 10
                                 return v, offset, hasload
                             end
-                            if addr == 13 && isa(v, LLVM.LoadInst) && !hasload
-                                return getparent(operands(v)[1], offset, true)
+                            if addr == 13  && !hasload
+                                if isa(v, LLVM.LoadInst)
+                                    v2, o2, hl2 = getparent(operands(v)[1], LLVM.ConstantInt(offty, 0), true)
+                                    rhs = LLVM.ConstantInt(offty, 0) 
+                                    if o2 != rhs
+                                        msg = sprint() do io::IO
+                                            println(
+                                                io,
+                                                "Enzyme internal error addr13 load doesn't keep offset 0",
+                                            )
+                                            println(io, "v=", string(v))
+                                            println(io, "v2=", string(v2))
+                                            println(io, "o2=", string(o2))
+                                            println(io, "hl2=", string(hl2))
+                                            println(io, "offty=", string(offty))
+                                            println(io, "rhs=", string(rhs))
+                                        end
+                                        throw(AssertionError(msg))
+                                    end
+                                    return v2, offset, true
+                                end
+                                if isa(v, LLVM.CallInst)
+                                    cf = LLVM.called_operand(v)
+                                    if isa(cf, LLVM.Function) && LLVM.name(cf) == "julia.gc_loaded"
+                                        ld = operands(v)[2]
+                                        while isa(ld, LLVM.BitCastInst) || isa(ld, LLVM.AddrSpaceCastInst)
+                                            ld = operands(ld)[1]
+                                        end
+                                        if isa(ld, LLVM.LoadInst)
+                                            v2, o2, hl2 = getparent(operands(ld)[1], LLVM.ConstantInt(offty, 0), true)
+                                            rhs = LLVM.ConstantInt(offty, sizeof(Int))
+
+                                            base_2, off_2, _ = get_base_and_offset(v2)
+                                            base_1, off_1, _ = get_base_and_offset(operands(v)[1])
+
+                                            if o2 == rhs && base_1 == base_2 && off_1 == off_2
+                                                return v2, offset, true
+                                            end
+
+                                            rhs = ptrtoint!(b, get_memory_data(b, operands(v)[1]), offty)
+                                            lhs = ptrtoint!(b, operands(v)[2], offty)
+                                            off2 = nuwsub!(b, rhs, lhs)
+                                            return v2, nuwadd!(b, offset, off2), true
+                                        end
+                                    end
+                                end
                             end
 
                             if addr == 13 && isa(v, LLVM.ConstantExpr)
@@ -892,7 +937,7 @@ function nodecayed_phis!(mod::LLVM.Module)
                                 return v2, offset, skipload
                             end
 
-                            if isa(v, LLVM.GetElementPtrInst) && !hasload
+                            if isa(v, LLVM.GetElementPtrInst)
                                 v2, offset, skipload =
                                     getparent(operands(v)[1], offset, hasload)
                                 offset = nuwadd!(
@@ -1033,9 +1078,27 @@ function nodecayed_phis!(mod::LLVM.Module)
 
                     position!(nb, nonphi)
                     if addr == 13
-                        nphi = bitcast!(nb, nphi, LLVM.PointerType(ty, 10))
-                        nphi = addrspacecast!(nb, nphi, LLVM.PointerType(ty, 11))
-                        nphi = load!(nb, ty, nphi)
+                        @static if VERSION < v"1.11-"
+                            nphi = bitcast!(nb, nphi, LLVM.PointerType(ty, 10))
+                            nphi = addrspacecast!(nb, nphi, LLVM.PointerType(ty, 11))
+                            nphi = load!(nb, ty, nphi)
+                        else
+                            base_obj = nphi
+
+                            jlt = LLVM.PointerType(LLVM.StructType(LLVM.LLVMType[]), 10)
+                            pjlt = LLVM.PointerType(jlt)
+
+                            nphi = get_memory_data(nb, nphi)
+                            nphi = bitcast!(nb, nphi, pjlt)
+
+                            GTy = LLVM.FunctionType(LLVM.PointerType(jlt, 13), LLVM.LLVMType[jlt, pjlt])
+                            gcloaded, _ = get_function!(
+                                mod,
+                                "julia.gc_loaded",
+                                GTy
+                            )
+                            nphi = call!(nb, GTy, gcloaded, LLVM.Value[base_obj, nphi])
+                        end
                     else
                         nphi = addrspacecast!(nb, nphi, ty)
                     end

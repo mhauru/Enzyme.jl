@@ -114,7 +114,9 @@ end
 export unsafe_to_llvm, unsafe_nothing_to_llvm
 
 function makeInstanceOf(B::LLVM.IRBuilder, @nospecialize(T))
-    @assert Core.Compiler.isconstType(T)
+    if !Core.Compiler.isconstType(T)
+        throw(AssertionError("Tried to make instance of non constant type $T"))
+    end
     @assert T <: Type
     return unsafe_to_llvm(B, T.parameters[1])
 end
@@ -247,3 +249,57 @@ end
 end
 
 export codegen_world_age
+
+
+if VERSION >= v"1.11.0-DEV.1552"
+
+# XXX: version of Base.method_instance that uses a function type
+@inline function my_methodinstance(@nospecialize(ft::Type), @nospecialize(tt::Type),
+                                world::Integer=tls_world_age())
+    sig = GPUCompiler.signature_type_by_tt(ft, tt)
+    # @assert Base.isdispatchtuple(sig)   # JuliaLang/julia#52233
+
+    mi = ccall(:jl_method_lookup_by_tt, Any,
+               (Any, Csize_t, Any),
+               sig, world, #=method_table=# nothing)
+    mi === nothing && throw(MethodError(ft, tt, world))
+    mi = mi::MethodInstance
+
+    # `jl_method_lookup_by_tt` and `jl_method_lookup` can return a unspecialized mi
+    if !Base.isdispatchtuple(mi.specTypes)
+        mi = Core.Compiler.specialize_method(mi.def, sig, mi.sparam_vals)::MethodInstance
+    end
+
+    return mi
+end
+else
+    import GPUCompiler: methodinstance as my_methodinstance
+end
+
+export my_methodinstance
+
+
+@static if VERSION < v"1.11-"
+
+@inline function typed_fieldtype(@nospecialize(T::Type), i::Int)
+    fieldtype(T, i)
+end
+
+else
+
+@inline function typed_fieldtype(@nospecialize(T::Type), i::Int)
+    if T <: GenericMemoryRef && i == 1 || T <: GenericMemory && i == 2
+        eT = eltype(T)
+        if !allocatedinline(eT) && Base.isconcretetype(eT)
+            Ptr{Ptr{eT}}
+        else
+            Ptr{eT}
+        end
+    else
+        fieldtype(T, i)
+    end
+end
+
+end
+
+export typed_fieldtype
